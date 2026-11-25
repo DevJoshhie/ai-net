@@ -72,6 +72,8 @@ import { type AuthService } from "../services/auth";
 import { createLogger } from "../utils/logger";
 import { AppError } from "../errors";
 import { getConfig } from "../config";
+import { createAuditRouter } from "./routes/audit";
+import { auditMiddleware } from "./middleware/auditMiddleware";
 
 const dispatchLogger = createLogger({ module: "http-dispatch" });
 
@@ -137,6 +139,7 @@ export function createApp(opts: AppOptions = {}): {
   app.use(createCorsMiddleware());
   app.use(requestId);
   app.use(requestLogger);
+  app.use(auditMiddleware);
   app.use(metricsMiddleware);
   app.use(rateLimitMiddleware);
   app.use(versioningMiddleware);
@@ -252,6 +255,9 @@ export function createApp(opts: AppOptions = {}): {
 
   // ── Payment reconciliation routes ──────────────────────────────────────────
   app.use("/api/reconciliation", createReconciliationRouter(opts.reconciliation));
+
+  // ── Audit log routes (#655) ────────────────────────────────────────────────
+  app.use("/api/audit", publicLimiter.middleware, createAuditRouter());
 
   app.use((_req: Request, res: Response) => {
     res.status(404).json({

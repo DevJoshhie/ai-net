@@ -200,7 +200,7 @@ function PaymentsPage() {
           </thead>
           <tbody>
             {loading ? (
-              Array.from({ length: 5 }).map((_, i) => (
+              Array.from({ length: 10 }).map((_, i) => (
                 <tr key={i} aria-hidden="true">
                   {Array.from({ length: 6 }).map((_, j) => (
                     <td key={j}><Skeleton height="1rem" width="80%" /></td>

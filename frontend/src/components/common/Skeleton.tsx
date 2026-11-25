@@ -167,7 +167,7 @@ export const SkeletonTaskDetail: React.FC = () => (
     <SkeletonCard className={styles.dagSkeleton}>
       <Skeleton width="12rem" height="1rem" />
       <div className={styles.dagNodes}>
-        {Array.from({ length: 3 }, (_, index) => <Skeleton key={index} variant="rect" width="9rem" height="5.75rem" />)}
+        {Array.from({ length: 5 }, (_, index) => <Skeleton key={index} variant="rect" width="9rem" height="5.75rem" />)}
       </div>
     </SkeletonCard>
     <div className={styles.taskPanels}>

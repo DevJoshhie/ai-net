@@ -11,7 +11,7 @@
 //!
 //! ## Flow
 //!
-//! 1. **`initialize`** — one-time setup of admin and treasury addresses.
+//! 1. **`initialize`** — one-time setup of admin, treasury, and token addresses.
 //! 2. **`set_min_stake`** — admin configures minimum stake per capability.
 //! 3. **`stake_bond`** — agent owner locks XLM against a capability.
 //!    Amount must be >= `get_min_stake(capability)`.
@@ -19,6 +19,9 @@
 //! 5. **`claim_unbonded`** — after 7 days the agent retrieves its stake.
 //! 6. **`slash_bond`** — admin slashes the entire remaining stake for
 //!    misbehaviour, routing the slashed amount to the treasury.
+//! 7. **`slash`** — dispute_resolution-only partial slash by address+bytes key.
+//! 8. **`slash_by_reason`** — dispute_resolution or platform_config admin
+//!    slashes by typed reason (5 / 25 / 100 %) and records slash history.
 //!
 //! ## Storage Layout
 //!
@@ -26,20 +29,29 @@
 //! |----------------------------------|-------------------------|------------|
 //! | `Admin`                          | `Address`               | Instance   |
 //! | `TreasuryAddress`                | `Address`               | Instance   |
+//! | `DisputeResolutionContract`      | `Address`               | Instance   |
+//! | `TokenContract`                  | `Address`               | Instance   |
+//! | `PlatformConfigAdmin`            | `Address`               | Instance   |
 //! | `MinStakePerCapability(cap)`     | `i128`                  | Persistent |
 //! | `StakeRecord(agent_id, cap)`     | `StakeRecord`           | Persistent |
 //! | `UnbondingRecord(agent_id, cap)` | `UnbondingRecord`       | Persistent |
+//! | `AddressStakeRecord(addr, bytes)`| `AddressStakeRecord`    | Persistent |
+//! | `SlashHistory(addr)`             | `Vec<SlashRecord>`      | Persistent |
+//! | `AgentSlashed(addr)`             | `bool`                  | Persistent |
+//! | `Blacklist(addr)`                | `u32` (expiry ledger)   | Persistent |
 //!
 //! ## Event Catalogue
 //!
-//! | Function          | Topics                         | Data               |
-//! |-------------------|--------------------------------|--------------------|
-//! | `stake_bond`      | `(staking, staked)`            | `BondStakedEvent`  |
-//! | `unstake_bond`    | `(staking, unstaked)`          | `BondUnstakedEvent`|
-//! | `slash_bond`      | `(staking, slashed)`           | `BondSlashedEvent` |
-//! | `claim_unbonded`  | `(staking, claimed)`           | `BondClaimedEvent` |
+//! | Function          | Topics                         | Data                  |
+//! |-------------------|--------------------------------|-----------------------|
+//! | `stake_bond`      | `(staking, staked)`            | `BondStakedEvent`     |
+//! | `unstake_bond`    | `(staking, unstaked)`          | `BondUnstakedEvent`   |
+//! | `slash_bond`      | `(staking, slashed)`           | `BondSlashedEvent`    |
+//! | `claim_unbonded`  | `(staking, claimed)`           | `BondClaimedEvent`    |
+//! | `slash`           | `(staking, cap_slshd)`         | `CapabilitySlashedEvent`|
+//! | `slash_by_reason` | `(staking, slshapply)`         | `SlashAppliedEvent`   |
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Bytes, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Bytes, Env, Symbol, Vec};
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -82,6 +94,12 @@ pub enum DataKey {
     Blacklist(Address),
     /// Address+Bytes keyed stake record for the new slash() path.
     AddressStakeRecord(Address, Bytes),
+    /// Per-agent slash history. Value = `Vec<SlashRecord>`.
+    SlashHistory(Address),
+    /// Permanently slashed agents (FraudProven at 100%). Value = `true`.
+    AgentSlashed(Address),
+    /// Platform config admin address — a secondary authorizer for `slash_by_reason`.
+    PlatformConfigAdmin,
 }
 
 // ─── Data Types ──────────────────────────────────────────────────────────────
@@ -182,6 +200,55 @@ pub struct AddressStakeRecord {
     pub capability: Bytes,
     pub amount_stroops: i128,
     pub staked_at: u32,
+}
+
+// ─── Slash-by-reason Types ────────────────────────────────────────────────────
+
+/// The reason a slash was applied. Determines the slash percentage.
+///
+/// | Variant       | Percentage |
+/// |---------------|------------|
+/// | `TaskFailure` | 5 %        |
+/// | `SLABreach`   | 25 %       |
+/// | `FraudProven` | 100 %      |
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SlashReason {
+    /// Minor task failure — 5 % of stake.
+    TaskFailure,
+    /// Service-level agreement breach — 25 % of stake.
+    SLABreach,
+    /// Proven fraud — 100 % of stake; agent permanently marked as Slashed.
+    FraudProven,
+}
+
+/// One entry in an agent's on-chain slash history.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlashRecord {
+    /// The reason this slash was applied.
+    pub reason: SlashReason,
+    /// Amount slashed, in stroops.
+    pub amount: i128,
+    /// Ledger sequence number at which the slash was executed.
+    pub timestamp: u64,
+    /// Optional transaction reference supplied by the caller.
+    /// Pass `Bytes::new(&env)` if no reference is available.
+    pub txn_ref: Bytes,
+}
+
+/// Event payload emitted by `slash_by_reason`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlashAppliedEvent {
+    /// The agent whose stake was slashed.
+    pub agent_id: Address,
+    /// The reason for the slash.
+    pub reason: SlashReason,
+    /// How many stroops were removed from the agent's stake.
+    pub amount_slashed: i128,
+    /// The agent's remaining stake after the slash (0 for FraudProven).
+    pub new_stake_balance: i128,
 }
 
 // ─── Error Codes ─────────────────────────────────────────────────────────────
@@ -685,6 +752,169 @@ impl CapabilityStakingContract {
         let _ = reason;
     }
 
+    // ── Slash-by-reason ─────────────────────────────────────────────────────
+
+    /// Store the platform_config admin address that is permitted (alongside the
+    /// dispute_resolution contract) to call `slash_by_reason`.
+    ///
+    /// # Authorization
+    /// Admin only.
+    pub fn set_platform_config_admin(env: Env, platform_admin: Address) {
+        let admin = load_admin(&env);
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformConfigAdmin, &platform_admin);
+        extend_instance_ttl(&env);
+    }
+
+    /// Slash an agent's stake by a typed reason.
+    ///
+    /// The slash percentage is determined by `reason`:
+    ///
+    /// | `reason`      | Percentage | Side effect                    |
+    /// |---------------|------------|--------------------------------|
+    /// | `TaskFailure` | 5 %        | None                           |
+    /// | `SLABreach`   | 25 %       | None                           |
+    /// | `FraudProven` | 100 %      | Agent marked permanently Slashed|
+    ///
+    /// The slashed funds are transferred from the contract's token balance to
+    /// the treasury address. A [`SlashRecord`] is appended to the agent's
+    /// persistent slash history, and a [`SlashAppliedEvent`] is emitted.
+    ///
+    /// # Parameters
+    /// - `caller`     — the invoking address; must be the dispute_resolution
+    ///                  contract or the platform_config admin.
+    /// - `agent_id`   — the agent whose stake is being slashed.
+    /// - `reason`     — determines the slash percentage.
+    /// - `capability` — the `Bytes` capability key identifying the stake record.
+    /// - `txn_ref`    — an optional transaction reference stored in history
+    ///                  (`Bytes::new(&env)` when not applicable).
+    ///
+    /// # Returns
+    /// The number of stroops slashed (always > 0 when a stake record exists).
+    ///
+    /// # Authorization
+    /// `caller` must be the configured dispute_resolution contract **or** the
+    /// platform_config admin. Any other address causes a panic with
+    /// `Error::Unauthorized`.
+    ///
+    /// # Errors
+    /// - Panics with `Error::Unauthorized` when `caller` is neither the
+    ///   dispute_resolution contract nor the platform_config admin.
+    /// - Panics with `Error::StakeNotFound` when no active stake record exists
+    ///   for the `(agent_id, capability)` pair.
+    pub fn slash_by_reason(
+        env: Env,
+        caller: Address,
+        agent_id: Address,
+        reason: SlashReason,
+        capability: Bytes,
+        txn_ref: Bytes,
+    ) -> i128 {
+        // ── Authorization ────────────────────────────────────────────────────
+        // The caller proves it is the authorised address via require_auth(),
+        // then we verify the address is one of the two permitted callers.
+        caller.require_auth();
+
+        let dr_contract: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DisputeResolutionContract);
+        let platform_admin: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformConfigAdmin);
+
+        let is_dr = dr_contract.map(|dr| dr == caller).unwrap_or(false);
+        let is_pa = platform_admin.map(|pa| pa == caller).unwrap_or(false);
+
+        if !is_dr && !is_pa {
+            panic!("unauthorized");
+        }
+
+        // ── Slash percentage ─────────────────────────────────────────────────
+        let percentage: i128 = match reason {
+            SlashReason::TaskFailure => 5,
+            SlashReason::SLABreach => 25,
+            SlashReason::FraudProven => 100,
+        };
+
+        // ── Load stake record ────────────────────────────────────────────────
+        let addr_key = DataKey::AddressStakeRecord(agent_id.clone(), capability.clone());
+        let record: AddressStakeRecord = env
+            .storage()
+            .persistent()
+            .get(&addr_key)
+            .unwrap_or_else(|| panic!("stake not found"));
+
+        // ── Calculate amounts ────────────────────────────────────────────────
+        let slash_amount = record.amount_stroops * percentage / 100;
+        let new_balance = record.amount_stroops - slash_amount;
+
+        let treasury = load_treasury(&env);
+        let token_id = load_token(&env);
+        let current_ledger = env.ledger().sequence();
+
+        // ── Transfer slashed funds to treasury ───────────────────────────────
+        if slash_amount > 0 {
+            token::Client::new(&env, &token_id).transfer(
+                &env.current_contract_address(),
+                &treasury,
+                &slash_amount,
+            );
+        }
+
+        // ── Update or remove stake record ────────────────────────────────────
+        if new_balance == 0 {
+            env.storage().persistent().remove(&addr_key);
+
+            // FraudProven (100 %) permanently marks the agent as Slashed.
+            let slashed_key = DataKey::AgentSlashed(agent_id.clone());
+            env.storage().persistent().set(&slashed_key, &true);
+            extend_persistent_ttl(&env, &slashed_key);
+        } else {
+            let updated = AddressStakeRecord {
+                amount_stroops: new_balance,
+                ..record
+            };
+            env.storage().persistent().set(&addr_key, &updated);
+            extend_persistent_ttl(&env, &addr_key);
+        }
+
+        // ── Append to slash history ──────────────────────────────────────────
+        let history_key = DataKey::SlashHistory(agent_id.clone());
+        let mut history: Vec<SlashRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        history.push_back(SlashRecord {
+            reason: reason.clone(),
+            amount: slash_amount,
+            timestamp: current_ledger as u64,
+            txn_ref,
+        });
+        env.storage().persistent().set(&history_key, &history);
+        extend_persistent_ttl(&env, &history_key);
+
+        extend_instance_ttl(&env);
+
+        // ── Emit SlashApplied event ──────────────────────────────────────────
+        env.events().publish(
+            (symbol_short!("staking"), symbol_short!("slshapply")),
+            SlashAppliedEvent {
+                agent_id,
+                reason,
+                amount_slashed: slash_amount,
+                new_stake_balance: new_balance,
+            },
+        );
+
+        slash_amount
+    }
+
     // ── Queries ─────────────────────────────────────────────────────────────
 
     /// Returns the active `StakeRecord` for an (agent_id, capability) pair, or
@@ -751,6 +981,27 @@ impl CapabilityStakingContract {
             Some(expires_at) => env.ledger().sequence() < expires_at,
             None => false,
         }
+    }
+
+    /// Returns `true` if `agent_id` has been permanently slashed via a
+    /// `FraudProven` slash that consumed their entire stake.
+    pub fn is_agent_slashed(env: Env, agent_id: Address) -> bool {
+        extend_instance_ttl(&env);
+        env.storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::AgentSlashed(agent_id))
+            .unwrap_or(false)
+    }
+
+    /// Returns the full slash history for `agent_id` in chronological order.
+    /// Returns an empty `Vec` when no slashes have been recorded.
+    pub fn get_slash_history(env: Env, agent_id: Address) -> Vec<SlashRecord> {
+        extend_instance_ttl(&env);
+        let history_key = DataKey::SlashHistory(agent_id);
+        env.storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 }
 
